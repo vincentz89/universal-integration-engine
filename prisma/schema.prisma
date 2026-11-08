@@ -1,0 +1,319 @@
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["partialIndexes"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ==========================================
+// ENUMS
+// ==========================================
+
+enum IdempotencyStatus {
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+enum SyncLogStatus {
+  PENDING
+  PROCESSING
+  SUCCESS
+  FAILED
+  SUPERSEDED
+}
+
+enum WebhookStatus {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  FAILED
+}
+
+enum OutboxStatus {
+  PENDING
+  PROCESSING
+  PUBLISHED
+  FAILED
+}
+
+// Authentication methods supported by the integration engine.
+enum IntegrationAuthType {
+  NONE
+  API_KEY
+  BASIC
+  BEARER
+  OAUTH2
+}
+
+// ==========================================
+// 1. TENANT CONFIGURATION
+// ==========================================
+
+model TenantConfig {
+  id String @id @default(uuid())
+
+  isActive Boolean @default(true)
+
+  integrations     TenantIntegrationConfig[]
+  syncLogs         SyncLog[]
+  webhookEvents    WebhookEvent[]
+  legacyReferences TenantLegacyReference[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive])
+}
+
+// ==========================================
+// 1.1 HISTORICAL TENANT REFERENCES
+// ==========================================
+
+// Preserves legacy identifiers for traceability and migration compatibility.
+model TenantLegacyReference {
+  id String @id @default(uuid())
+
+  tenantId String
+  tenant   TenantConfig @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  // Identifies the kind of historical reference.
+  // Example: LEGACY_STORE_ID.
+  referenceType String
+
+  // Original identifier, preserved without normalization.
+  referenceValue String
+
+  // Provider associated with the reference, if known.
+  // Null means the original provider has not been verified.
+  sourceSystem String?
+
+  createdAt DateTime @default(now())
+
+  // Prevent duplicate references within the same tenant.
+  @@unique([tenantId, referenceType, referenceValue])
+  @@index([tenantId])
+  @@index([sourceSystem])
+}
+
+// ==========================================
+// 2. TENANT-SPECIFIC INTEGRATIONS
+// ==========================================
+
+model TenantIntegrationConfig {
+  id String @id @default(uuid())
+
+  tenantId String
+  tenant   TenantConfig @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  systemName              String
+  externalAccountId       String?
+  externalAccountKey      String?
+  externalAccountMetadata Json?
+
+  baseUrl String?
+
+  authType             IntegrationAuthType @default(NONE)
+  credentialsEncrypted String?             @db.Text
+
+  tokenType            String?
+  accessTokenExpiresAt DateTime?
+
+  authConfig Json?
+
+  tokenRefreshLockToken     String?
+  tokenRefreshLockExpiresAt DateTime?
+
+  isActive Boolean @default(true)
+
+  webhookEvents WebhookEvent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([id, tenantId])
+  @@unique([systemName, externalAccountKey])
+  @@index([tenantId, systemName, isActive])
+  @@index([tokenRefreshLockExpiresAt])
+}
+
+// ==========================================
+// 3. BACKGROUND JOB LOGS
+// ==========================================
+
+model SyncLog {
+  id String @id @default(uuid())
+
+  // Tenant ownership
+  tenantId String?
+  tenant   TenantConfig? @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  // BullMQ identification
+  queueName String?
+  jobId     String?
+  jobName   String
+
+  // Integration identification
+  source String?
+  target String?
+
+  // Workflow tracing
+  correlationId  String?
+  webhookEventId String?
+
+  // Execution status
+  status SyncLogStatus @default(PENDING)
+
+  // Retry tracking
+  attemptCount Int @default(0)
+
+  // Error diagnostics
+  errorMessage String? @db.Text
+  errorStack   String? @db.Text
+
+  // Diagnostic data
+  payload  Json?
+  metadata Json?
+
+  // Execution timing
+  startedAt  DateTime?
+  finishedAt DateTime?
+  durationMs Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, status, createdAt])
+  @@index([tenantId, jobName, createdAt])
+  @@index([jobId])
+  @@index([correlationId])
+  @@index([status, createdAt])
+}
+
+// ==========================================
+// 4. WEBHOOK EVENTS
+// ==========================================
+
+model WebhookEvent {
+  id String @id @default(uuid())
+
+  // Tenant ownership
+  tenantId String
+  tenant   TenantConfig @relation(fields: [tenantId], references: [id], onDelete: Restrict)
+
+  // Webhook identification
+  source          String
+  eventType       String
+  externalEventId String?
+
+  // Processing status
+  status WebhookStatus @default(RECEIVED)
+
+  // Original event payload
+  payload Json
+
+  // Workflow tracing
+  correlationId String?
+
+  // Processing diagnostics
+  errorMessage String?   @db.Text
+  processedAt  DateTime?
+
+  integrationId String?
+  integration   TenantIntegrationConfig? @relation(fields: [integrationId, tenantId], references: [id, tenantId], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Enforce uniqueness for events owned by a specific integration.
+  @@unique([tenantId, source, integrationId, externalEventId], where: { integrationId: { not: null }, externalEventId: { not: null } }, map: "WebhookEvent_integration_event_unique")
+  // Preserve uniqueness for historical events without an integration association.
+  @@unique([tenantId, source, externalEventId], where: { integrationId: null, externalEventId: { not: null } }, map: "WebhookEvent_legacy_event_unique")
+  @@index([tenantId, createdAt])
+  @@index([tenantId, status, createdAt])
+  @@index([correlationId])
+}
+
+// ==========================================
+// 5. IDEMPOTENCY RECORDS
+// ==========================================
+
+model IdempotencyRecord {
+  id                    String            @id @default(uuid())
+  tenantKey             String            @default("SYSTEM")
+  scope                 String            @db.VarChar(150)
+  idempotencyKey        String            @db.VarChar(255)
+  jobName               String
+  jobId                 String?
+  requestHash           String?           @db.VarChar(64)
+  status                IdempotencyStatus @default(PROCESSING)
+  result                Json?
+  errorMessage          String?           @db.Text
+  attemptCount          Int               @default(0)
+  // Autonomous recovery retry tracking
+  recoveryAttemptCount  Int               @default(0)
+  recoveryNextAttemptAt DateTime?
+  recoveryLastError     String?           @db.Text
+  // Prevents autonomous recovery of records with permanent integrity errors.
+  recoveryBlockedAt     DateTime?
+
+  startedAt      DateTime?
+  completedAt    DateTime?
+  leaseExpiresAt DateTime?
+  leaseToken     String?   @db.VarChar(36)
+  expiresAt      DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([tenantKey, scope, idempotencyKey])
+  @@index([tenantKey, status, createdAt])
+  @@index([status, leaseExpiresAt])
+  @@index([jobId])
+  @@index([createdAt])
+  @@index([status, jobName, recoveryNextAttemptAt, leaseExpiresAt])
+}
+
+// ==========================================
+// 6. TRANSACTIONAL OUTBOX
+// ==========================================
+
+model OutboxEvent {
+  id String @id @default(uuid())
+
+  // Generic event identification
+  eventType     String
+  aggregateType String?
+  aggregateId   String?
+
+  // Prevent duplicate outbox instructions
+  deduplicationKey String @unique @db.VarChar(255)
+
+  // Queue dispatch information
+  payload Json
+
+  // Dispatch lifecycle
+  status OutboxStatus @default(PENDING)
+
+  // Retry tracking
+  attemptCount Int      @default(0)
+  availableAt  DateTime @default(now())
+
+  // Dispatcher ownership
+  lockedAt  DateTime?
+  lockToken String?   @db.VarChar(36)
+
+  // Publishing information
+  publishedAt DateTime?
+  lastError   String?   @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, availableAt])
+  @@index([status, lockedAt])
+  @@index([aggregateType, aggregateId])
+  @@index([createdAt])
+}

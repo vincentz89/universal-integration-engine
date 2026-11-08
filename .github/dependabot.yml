@@ -1,0 +1,28 @@
+version: 2
+
+updates:
+  # Monitor npm dependencies.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Manila"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "automated"
+
+  # Monitor GitHub Actions versions.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Asia/Manila"
+    open-pull-requests-limit: 5
+    labels:
+      - "github-actions"
+      - "automated"
